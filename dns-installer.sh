@@ -1,73 +1,63 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# DNSPro SmartDNSProxy Installer
+# Compatible with: Ubuntu 20.04+/22.04+, AlmaLinux 8+/9+
+# Author: AriaNet - https://github.com/MrAriaNet
 
-# DNSPro - Smart DNS Proxy
-# write by : @MrAriaNet
+set -euo pipefail
 
-# Detect package manager
-if command -v dnf > /dev/null; then
-    PACKAGE_MANAGER="dnf"
-elif command -v yum > /dev/null; then
-    PACKAGE_MANAGER="yum"
-elif command -v apt > /dev/null; then
-    PACKAGE_MANAGER="apt"
-else
-    echo "Unsupported package manager. Exiting."
-    exit 1
-fi
+# Color output for clarity
+green() { echo -e "\e[32m$1\e[0m"; }
+red() { echo -e "\e[31m$1\e[0m"; }
 
-# Install function
-install_packages() {
-    if [[ "$PACKAGE_MANAGER" == "apt" ]]; then
-        apt update > /dev/null 2>&1
-        apt install -y "$@" > /dev/null 2>&1
+# OS detection
+detect_os() {
+    source /etc/os-release
+    OS=$ID
+    VER=$VERSION_ID
+
+    if [[ "$OS" =~ ^(ubuntu|debian)$ ]]; then
+        PACKAGE_MANAGER="apt"
+    elif [[ "$OS" =~ ^(almalinux|centos|rhel)$ ]]; then
+        PACKAGE_MANAGER="dnf"
     else
-        $PACKAGE_MANAGER install -y "$@" > /dev/null 2>&1
+        red "Unsupported OS: $OS"
+        exit 1
     fi
 }
 
-# Group install for development tools
-install_dev_tools() {
-    if [[ "$PACKAGE_MANAGER" == "dnf" || "$PACKAGE_MANAGER" == "yum" ]]; then
-        $PACKAGE_MANAGER groupinstall -y "Development Tools" > /dev/null 2>&1
-    elif [[ "$PACKAGE_MANAGER" == "apt" ]]; then
-        apt update > /dev/null 2>&1
-        apt install -y build-essential > /dev/null 2>&1
+# Install required packages
+install_dependencies() {
+    green "[*] Installing required packages..."
+    if [[ "$PACKAGE_MANAGER" == "apt" ]]; then
+        apt update -y
+        apt install -y curl git build-essential autoconf automake libtool pkg-config \
+                       libev-dev libudns-dev zlib1g-dev libpcre3-dev nginx dnsmasq
+    else
+        dnf install -y epel-release
+        dnf groupinstall -y "Development Tools"
+        dnf install -y curl git autoconf automake libtool pkgconfig libev-devel udns-devel \
+                       zlib-devel pcre-devel nginx dnsmasq
     fi
 }
 
-if [ ! -f /etc/dnsmasq.d/sniproxy.conf ]; then
-    echo -e "- Installation started ...\n";
-    sleep 2;
+# Compile and install sniproxy
+install_sniproxy() {
+    green "[*] Cloning and installing sniproxy..."
+    git clone https://github.com/dlundquist/sniproxy.git /tmp/sniproxy
+    cd /tmp/sniproxy
+    ./autogen.sh
+    ./configure
+    make -j"$(nproc)"
+    make install
+    cd -
+    rm -rf /tmp/sniproxy
+}
 
-    # Install prerequisites
-    echo "Installing prerequisites...";
-    install_packages autoconf automake curl gettext libev-dev libpcre3-dev perl pkg-config zlib1g-dev udns-dev zsh git dnsmasq nginx
-    echo -e "Prerequisites installed.\n";
-    sleep 2;
-
-    # Install development tools
-    echo "Installing development tools...";
-    install_dev_tools
-    echo -e "Development tools installed.\n";
-    sleep 2;
-
-    # Clone and build sniproxy
-    echo "Cloning and building sniproxy...";
-    git clone http://github.com/dlundquist/sniproxy.git > /dev/null 2>&1
-    cd sniproxy || exit
-    ./autogen.sh > /dev/null 2>&1
-    ./configure > /dev/null 2>&1
-    make > /dev/null 2>&1
-    make install > /dev/null 2>&1
-    echo -e "sniproxy built and installed successfully.\n";
-    cd .. || exit
-    sleep 2;
-
-    # Create config file for sniproxy
-    echo "Creating sniproxy configuration file...";
-    cat << EOF > /etc/sniproxy.conf
+# Create sniproxy config
+create_sniproxy_config() {
+    green "[*] Creating sniproxy config..."
+    cat <<EOF > /etc/sniproxy.conf
 user daemon
-
 pidfile /var/run/sniproxy.pid
 
 resolver {
@@ -84,56 +74,63 @@ table {
     .* *
 }
 EOF
-    echo "sniproxy configuration file created.";
-    sleep 2;
+}
 
-    # Create systemd service file for sniproxy
-    echo "Creating systemd service file for sniproxy...";
-    cat << EOF > /etc/systemd/system/sniproxy.service
+# Create sniproxy systemd service
+create_sniproxy_service() {
+    green "[*] Creating systemd service for sniproxy..."
+    cat <<EOF > /etc/systemd/system/sniproxy.service
 [Unit]
 Description=SNI Proxy Service
 After=network.target
 
 [Service]
-Type=simple
 ExecStart=/usr/local/sbin/sniproxy -c /etc/sniproxy.conf
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    echo "Systemd service file for sniproxy created.";
-    sleep 2;
+}
 
-    # Configure dnsmasq
-    echo "Configuring dnsmasq...";
-    cat << EOF > /etc/dnsmasq.conf
+# Configure DNSMasq
+configure_dnsmasq() {
+    green "[*] Configuring dnsmasq..."
+    cat <<EOF > /etc/dnsmasq.conf
 conf-dir=/etc/dnsmasq.d/,*.conf
 cache-size=100000
 no-resolv
 server=1.1.1.1
 server=8.8.8.8
-interface=eth0
 interface=lo
 EOF
-    echo "dnsmasq configuration file created.";
-    sleep 2;
+}
 
-    # Enable and start services
-    echo "Enabling and starting services...";
-	systemctl daemon-reload > /dev/null 2>&1
-    systemctl enable sniproxy dnsmasq nginx > /dev/null 2>&1
-    systemctl start sniproxy dnsmasq nginx > /dev/null 2>&1
-    echo "All services started successfully.";
+# Download and apply nginx config
+configure_nginx() {
+    green "[*] Downloading nginx config..."
+    curl -fsSL -o /etc/nginx/nginx.conf https://raw.githubusercontent.com/MrAriaNet/DNSPro-SmartDNSProxy/main/nginx/nginx.conf
+}
 
-    echo "- Installation completed successfully.";
-else
-    echo -e "- Smart DNS is already installed on the server.\n";
-    echo "Updating server packages...";
-    if [[ "$PACKAGE_MANAGER" == "apt" ]]; then
-        apt update && apt upgrade -y > /dev/null 2>&1
-    else
-        $PACKAGE_MANAGER update -y > /dev/null 2>&1
-    fi
-    echo "Server packages updated successfully.";
-    sleep 2;
-fi
+# Start and enable services
+enable_services() {
+    green "[*] Enabling and starting services..."
+    systemctl daemon-reexec
+    systemctl daemon-reload
+    systemctl enable --now sniproxy dnsmasq nginx
+    systemctl restart sniproxy dnsmasq nginx
+}
+
+main() {
+    detect_os
+    install_dependencies
+    install_sniproxy
+    create_sniproxy_config
+    create_sniproxy_service
+    configure_dnsmasq
+    configure_nginx
+    enable_services
+    green "[✔] DNSPro SmartDNSProxy installation completed successfully!"
+}
+
+main "$@"
